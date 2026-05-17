@@ -455,8 +455,11 @@ void HttpServer::worker_loop() {
             }
         } else if (!req.stream && !client_disconnected) {
             // Non-streaming: build complete response using emitter state.
-            // Feed all tokens through emitter first.
+            // Feed all tokens through emitter (skip specials like streaming path).
             for (int32_t tok : result.tokens) {
+                const std::string & raw = tokenizer_.raw_token(tok);
+                if (tok == tokenizer_.eos_id()) continue;
+                if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|') continue;
                 std::string text = tokenizer_.token_text(tok);
                 emitter.emit_token(text);
             }
@@ -676,12 +679,21 @@ bool HttpServer::read_http_request(int fd, HttpRequest & out) {
 bool HttpServer::send_all(int fd, const void * data, size_t len) {
     const char * p = (const char *)data;
     size_t sent = 0;
+    // Stall deadline resets on each successful write (ds4 pattern).
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (sent < len) {
-        // Use poll() with timeout to detect stalled connections.
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) return false;  // stall timeout
+
         struct pollfd pfd = {fd, POLLOUT, 0};
-        int ret = poll(&pfd, 1, 30000);  // 30s timeout
-        if (ret <= 0) return false;       // timeout or error
-        if (pfd.revents & (POLLERR | POLLHUP)) return false;
+        int timeout = remaining > 50 ? 50 : (int)remaining;
+        int ret;
+        do {
+            ret = poll(&pfd, 1, timeout);
+        } while (ret < 0 && errno == EINTR);
+        if (ret < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) return false;
+        if (ret == 0) continue;  // poll timeout, retry until deadline
 
         ssize_t n = send(fd, p + sent, len - sent, MSG_NOSIGNAL);
         if (n < 0) {
@@ -690,6 +702,7 @@ bool HttpServer::send_all(int fd, const void * data, size_t len) {
             return false;  // EPIPE, ECONNRESET, etc.
         }
         sent += n;
+        deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     }
     return true;
 }

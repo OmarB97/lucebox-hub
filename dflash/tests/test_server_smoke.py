@@ -92,7 +92,7 @@ class SmokeTest:
                 "messages": [
                     {"role": "user", "content": "Say hello in one word."}
                 ],
-                "max_tokens": 32,
+                "max_tokens": 256,
                 "temperature": 0.0,
                 "stream": True,
             }, stream=True, timeout=120.0)
@@ -110,7 +110,8 @@ class SmokeTest:
                 if line.startswith("data: "):
                     chunk = json.loads(line[6:])
                     chunks.append(chunk)
-                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    choices = chunk.get("choices") or [{}]
+                    delta = choices[0].get("delta", {})
                     if "content" in delta:
                         text += delta["content"]
 
@@ -132,7 +133,7 @@ class SmokeTest:
                 "messages": [
                     {"role": "user", "content": "What is 2+2? Reply with just the number."}
                 ],
-                "max_tokens": 16,
+                "max_tokens": 256,
                 "temperature": 0.0,
                 "stream": False,
             }, timeout=120.0)
@@ -168,7 +169,7 @@ class SmokeTest:
                 "messages": [
                     {"role": "user", "content": "Say hi in one word."}
                 ],
-                "max_tokens": 32,
+                "max_tokens": 256,
                 "temperature": 0.0,
                 "stream": True,
             }, stream=True, timeout=120.0)
@@ -207,7 +208,7 @@ class SmokeTest:
             resp = self._req("POST", "/v1/responses", {
                 "model": "dflash",
                 "input": "What is 1+1? Reply with just the number.",
-                "max_tokens": 16,
+                "max_tokens": 256,
                 "temperature": 0.0,
                 "stream": True,
             }, stream=True, timeout=120.0)
