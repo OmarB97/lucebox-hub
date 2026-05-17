@@ -1,54 +1,13 @@
 // SSE emitter implementation — streaming state machine for all 3 API formats.
 
 #include "sse_emitter.h"
+#include "utf8_utils.h"
 
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 
 namespace dflash27b {
-
-// Snap a byte offset back to a UTF-8 code-point boundary.
-// Returns the largest position <= `pos` that doesn't split a multi-byte sequence.
-// (Mirrors ds4_server.c's utf8_stream_safe_len.)
-static size_t utf8_safe_len(const std::string & s, size_t pos) {
-    if (pos >= s.size()) return s.size();
-    // Walk backwards while we're on a continuation byte (10xxxxxx).
-    while (pos > 0 && (s[pos] & 0xC0) == 0x80) pos--;
-    return pos;
-}
-
-// Sanitize a string for JSON: replace invalid/incomplete UTF-8 with U+FFFD.
-static std::string utf8_sanitize(const std::string & s) {
-    std::string out;
-    out.reserve(s.size());
-    size_t i = 0;
-    while (i < s.size()) {
-        uint8_t c = (uint8_t)s[i];
-        size_t seq_len = 0;
-        if (c < 0x80) seq_len = 1;
-        else if ((c & 0xE0) == 0xC0) seq_len = 2;
-        else if ((c & 0xF0) == 0xE0) seq_len = 3;
-        else if ((c & 0xF8) == 0xF0) seq_len = 4;
-        if (seq_len == 0 || i + seq_len > s.size()) {
-            out += "\xEF\xBF\xBD";  // U+FFFD
-            i++;
-            continue;
-        }
-        bool valid = true;
-        for (size_t j = 1; j < seq_len; j++) {
-            if (((uint8_t)s[i + j] & 0xC0) != 0x80) { valid = false; break; }
-        }
-        if (valid) {
-            out.append(s, i, seq_len);
-            i += seq_len;
-        } else {
-            out += "\xEF\xBF\xBD";
-            i++;
-        }
-    }
-    return out;
-}
 
 static const char THINK_OPEN[]  = "<think>";
 static const char THINK_CLOSE[] = "</think>";
