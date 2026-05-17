@@ -205,6 +205,39 @@ def first_stop_match(text: str, stops: list[str]) -> int:
     return best
 
 
+def split_unclosed_thinking(text: str) -> tuple[str, str | None]:
+    """Best-effort visible answer fallback when Qwen never emits </think>."""
+    value = text.strip()
+    if not value:
+        return "", None
+
+    marker_re = re.compile(
+        r"(?is)(?:^|\n)\s*(?:\d+\.\s*)?(?:\*+)?\s*"
+        r"(?:final answer|final output|answer|output|result)"
+        r"\s*(?:\*+)?\s*[:：]\s*(?:\*+)?\s*(.+?)\s*$"
+    )
+    marker = None
+    for match in marker_re.finditer(value):
+        marker = match
+    if marker:
+        content = marker.group(1).strip()
+        chunks = [c.strip() for c in re.split(r"\n\s*\n+", content) if c.strip()]
+        if len(chunks) > 1:
+            content = chunks[-1]
+        idx = value.rfind(content)
+        reasoning = value[:idx].strip() if idx > 0 else None
+        return content, reasoning or None
+
+    chunks = [c.strip() for c in re.split(r"\n\s*\n+", value) if c.strip()]
+    if len(chunks) >= 2:
+        content = chunks[-1]
+        idx = value.rfind(content)
+        reasoning = value[:idx].strip() if idx > 0 else None
+        return content, reasoning or None
+
+    return value, None
+
+
 def parse_reasoning(
     text: str,
     thinking_enabled: bool = True,
@@ -225,7 +258,7 @@ def parse_reasoning(
     rest = parts[2] if saw_open_tag else parts[0]
     if THINK_CLOSE_TAG not in rest:
         if thinking_enabled and (started_in_thinking or saw_open_tag):
-            return "", (rest.strip() or None)
+            return split_unclosed_thinking(rest)
         return _strip_leading_think_closers(rest), None
     reasoning, _, content = rest.partition(THINK_CLOSE_TAG)
     return _strip_leading_think_closers(content), (reasoning.strip() or None)
@@ -239,6 +272,11 @@ def _thinking_enabled(template_kwargs: dict | None) -> bool:
 def prompt_starts_in_thinking(prompt: str) -> bool:
     """True when the chat template ended by opening a think block."""
     return bool(re.search(r"<think>\s*$", prompt))
+
+
+def strip_closed_think_prefill(prompt: str) -> str:
+    """Remove Qwen's no-thinking assistant prefill when it closes the turn."""
+    return re.sub(r"<think>\s*</think>\s*$", "", prompt)
 
 
 def _find_tool_properties(tools, function_name):
@@ -906,9 +944,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         ``template_kwargs`` is passed through to ``apply_chat_template`` so callers
         can toggle template knobs like ``enable_thinking`` per-request.
 
-        Thinking is disabled by default (enable_thinking=False) because Qwen3.6's
-        think mode wrecks DFlash acceptance rates. Clients can opt in by sending
-        ``"chat_template_kwargs": {"enable_thinking": true}`` in the request.
+        Thinking is disabled by default, but Qwen3.6's no-thinking template
+        pre-fills a closed ``<think></think>`` block that can make the model emit
+        EOS immediately. We strip that trailing closed block before tokenization
+        so the assistant turn remains open without enabling think mode.
         """
         tpl_kwargs: dict = {"tokenize": False, "add_generation_prompt": True,
                             "enable_thinking": False}
@@ -918,6 +957,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         if tools_arg:
             tpl_kwargs["tools"] = tools_arg
         prompt = tokenizer.apply_chat_template(msgs_list, **tpl_kwargs)
+        if not _thinking_enabled(tpl_kwargs):
+            prompt = strip_closed_think_prefill(prompt)
         started_in_thinking = bool(re.search(r"<think>\s*$", prompt))
         ids = tokenizer.encode(prompt, add_special_tokens=False)
         if not ids:
@@ -999,6 +1040,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             pass
         return new_bin, new_ids
 
+    _vocab_size: int = getattr(tokenizer, "vocab_size", 0) or 0
+
     def _token_stream(r, n_gen, timing=None):
         generated = 0
         hit_stop = False
@@ -1011,6 +1054,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 if timing is not None:
                     timing["daemon_done"] = True
                 break
+            if _vocab_size and not (0 <= tok_id < _vocab_size):
+                continue
             if timing and timing.get("t_first_tok") is None:
                 timing["t_first_tok"] = time.monotonic()
             if hit_stop:
@@ -1048,6 +1093,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 if timing is not None:
                     timing["daemon_done"] = True
                 break
+            if _vocab_size and not (0 <= tok_id < _vocab_size):
+                continue
             if timing and timing.get("t_first_tok") is None:
                 timing["t_first_tok"] = time.monotonic()
             if hit_stop:
@@ -1343,6 +1390,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     window = ""
                     tool_buffer = ""
                     accumulated_content = ""
+                    accumulated_reasoning = ""
                     accumulated_raw_text = ""
                     stops = normalize_stop(req.stop)
                     tag_holdback = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG), len(TOOL_OPEN_TAG))
@@ -1369,7 +1417,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                     window = window[:si]
                                     stop_hit = True
                                     kind = "reasoning_content" if mode == "reasoning" else "content"
-                                    if mode == "content":
+                                    if mode == "reasoning":
+                                        accumulated_reasoning += window
+                                    elif mode == "content":
                                         accumulated_content += window
                                     out = emit_delta(window, kind)
                                     if out: yield out
@@ -1386,6 +1436,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                     idx = window.find(THINK_CLOSE_TAG)
                                     if idx != -1:
                                         pre = window[:idx]
+                                        accumulated_reasoning += pre
                                         out = emit_delta(pre, "reasoning_content")
                                         if out: yield out
                                         window = window[idx + len(THINK_CLOSE_TAG):]
@@ -1393,6 +1444,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                         continue
                                     if len(window) > HOLDBACK:
                                         safe = window[:-HOLDBACK]
+                                        accumulated_reasoning += safe
                                         out = emit_delta(safe, "reasoning_content")
                                         if out: yield out
                                         window = window[-HOLDBACK:]
@@ -1413,9 +1465,15 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                         accumulated_content += pre
                                         out = emit_delta(pre, "content")
                                         if out: yield out
-                                        if which == "think":
+                                        if which == "think" and _thinking_enabled(req.chat_template_kwargs):
                                             window = window[idx + len(THINK_OPEN_TAG):]
                                             mode = "reasoning"
+                                        elif which == "think":
+                                            # thinking disabled — keep tag in content
+                                            accumulated_content += THINK_OPEN_TAG
+                                            out = emit_delta(THINK_OPEN_TAG, "content")
+                                            if out: yield out
+                                            window = window[idx + len(THINK_OPEN_TAG):]
                                         elif which == "think_close":
                                             window = window[idx + len(THINK_CLOSE_TAG):]
                                         else:
@@ -1432,6 +1490,12 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                     break
 
                         if stop_hit:
+                            if mode == "reasoning" and not accumulated_content:
+                                fallback_content, _ = split_unclosed_thinking(accumulated_reasoning)
+                                if fallback_content:
+                                    accumulated_content += fallback_content
+                                    out = emit_delta(fallback_content, "content")
+                                    if out: yield out
                             finish_reason = "stop"
                             yield f"data: {json.dumps(chunk({}, finish=finish_reason))}\n\n"
                             if include_usage:
@@ -1454,6 +1518,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
 
                         # Flush remaining
                         if mode == "reasoning" and window:
+                            accumulated_reasoning += window
                             out = emit_delta(window, "reasoning_content")
                             if out: yield out
                         elif mode == "content" and window:
@@ -1463,6 +1528,13 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         elif mode == "tool_buffer":
                             tool_buffer += window
                         window = ""
+
+                        if mode == "reasoning" and not accumulated_content:
+                            fallback_content, _ = split_unclosed_thinking(accumulated_reasoning)
+                            if fallback_content:
+                                accumulated_content += fallback_content
+                                out = emit_delta(fallback_content, "content")
+                                if out: yield out
 
                         finish_reason = "stop"
                         if mode == "tool_buffer":
@@ -1594,10 +1666,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             i = first_stop_match(text, stops)
             if i != -1:
                 text = text[:i]
-        # Parse reasoning and tool calls
-        thinking_enabled = True
-        if req.chat_template_kwargs:
-            thinking_enabled = req.chat_template_kwargs.get("enable_thinking", True)
+        # Parse reasoning and tool calls using the same effective thinking
+        # setting that was used when rendering the prompt.
+        thinking_enabled = _thinking_enabled(req.chat_template_kwargs)
         cleaned, tool_calls = parse_tool_calls(text, tools=req.tools)
         _remember_tool_call_text(text, tool_calls)
         cleaned, reasoning = parse_reasoning(
@@ -2230,9 +2301,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             except Exception: pass
 
         text = tokenizer.decode(tokens, skip_special_tokens=True)
-        thinking_enabled = True
-        if chat_req.chat_template_kwargs:
-            thinking_enabled = chat_req.chat_template_kwargs.get("enable_thinking", True)
+        thinking_enabled = _thinking_enabled(chat_req.chat_template_kwargs)
         cleaned, tool_calls = parse_tool_calls(text, tools=chat_req.tools)
         _remember_tool_call_text(text, tool_calls)
         cleaned, reasoning = parse_reasoning(
@@ -2374,6 +2443,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 window = ""
                 tool_buffer = ""
                 accumulated_text = ""
+                accumulated_reasoning = ""
                 accumulated_raw_text = ""
                 tag_holdback = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG), len(TOOL_OPEN_TAG))
                 HOLDBACK = tag_holdback
@@ -2396,10 +2466,12 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             if mode == "reasoning":
                                 idx = window.find(THINK_CLOSE_TAG)
                                 if idx != -1:
+                                    accumulated_reasoning += window[:idx]
                                     window = window[idx + len(THINK_CLOSE_TAG):]
                                     mode = "content"
                                     continue
                                 if len(window) > HOLDBACK:
+                                    accumulated_reasoning += window[:-HOLDBACK]
                                     window = window[-HOLDBACK:]
                                 break
 
@@ -2420,9 +2492,16 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                         yield _resp_sse("response.output_text.delta", {
                                             "item_id": msg_item_id, "output_index": 0,
                                             "content_index": 0, "delta": pre})
-                                    if which == "think":
+                                    if which == "think" and _thinking_enabled(chat_req.chat_template_kwargs):
                                         window = window[idx + len(THINK_OPEN_TAG):]
                                         mode = "reasoning"
+                                    elif which == "think":
+                                        # thinking disabled — keep tag in content
+                                        accumulated_text += THINK_OPEN_TAG
+                                        yield _resp_sse("response.output_text.delta", {
+                                            "item_id": msg_item_id, "output_index": 0,
+                                            "content_index": 0, "delta": THINK_OPEN_TAG})
+                                        window = window[idx + len(THINK_OPEN_TAG):]
                                     elif which == "think_close":
                                         window = window[idx + len(THINK_CLOSE_TAG):]
                                     else:
@@ -2440,7 +2519,15 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                 break
 
                     # Flush remaining window
-                    if mode == "content" and window:
+                    if mode == "reasoning":
+                        accumulated_reasoning += window
+                        fallback_text, _ = split_unclosed_thinking(accumulated_reasoning)
+                        if fallback_text:
+                            accumulated_text += fallback_text
+                            yield _resp_sse("response.output_text.delta", {
+                                "item_id": msg_item_id, "output_index": 0,
+                                "content_index": 0, "delta": fallback_text})
+                    elif mode == "content" and window:
                         accumulated_text += window
                         yield _resp_sse("response.output_text.delta", {
                             "item_id": msg_item_id, "output_index": 0,
