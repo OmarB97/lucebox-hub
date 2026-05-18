@@ -1542,6 +1542,53 @@ def _score_gsm_response(text: str, gold_answer: str) -> tuple[bool, str]:
     return correct, detail
 
 
+def _score_he_response(text: str, entry_point: str, gold_test: str) -> tuple[bool, str]:
+    """Score a HumanEval response by executing the generated code against test cases.
+
+    Extracts code from model output, appends the test harness, and runs via subprocess.
+    Returns (correct, detail_str).
+    """
+    import subprocess as _sp
+    import tempfile as _tmp
+
+    think_end = text.rfind("</think>")
+    answer_text = text[think_end + len("</think>"):] if think_end >= 0 else text
+
+    # Extract code block (```python ... ``` or ``` ... ```)
+    code = None
+    m = _re.search(r'```(?:python)?\s*\n(.*?)```', answer_text, _re.DOTALL)
+    if m:
+        code = m.group(1)
+    else:
+        # Try to find the function definition directly
+        m = _re.search(r'((?:from\s|import\s).*?\n)?(\s*def\s+' + _re.escape(entry_point) + r'\b.*)',
+                       answer_text, _re.DOTALL)
+        if m:
+            prefix = m.group(1) or ""
+            code = prefix + m.group(2)
+
+    if not code:
+        return False, "no code extracted"
+
+    # Build test script: function code + test harness + call check(entry_point)
+    test_script = code + "\n" + gold_test + f"\ncheck({entry_point})\n"
+
+    try:
+        result = _sp.run(
+            ["python3", "-c", test_script],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            return True, "correct: tests passed"
+        else:
+            err = result.stderr.strip().split('\n')[-1] if result.stderr else "unknown error"
+            return False, f"wrong: {err[:80]}"
+    except _sp.TimeoutExpired:
+        return False, "wrong: timeout"
+    except Exception as e:
+        return False, f"error: {str(e)[:80]}"
+
+
 # ── bench subcommand ────────────────────────────────────────────────────────
 
 BENCH_SUITES = ("he", "gsm", "math", "agent")
@@ -1706,7 +1753,16 @@ def _run_bench_suite(
 
         # Correctness scoring
         score_detail = ""
-        if "gold_answer" in case and result.get("text"):
+        if suite == "he" and "gold_test" in case and result.get("text"):
+            correct, detail = _score_he_response(
+                result["text"], case["entry_point"], case["gold_test"])
+            result["correct"] = correct
+            result["score_detail"] = detail
+            n_scored += 1
+            if correct:
+                n_correct += 1
+            score_detail = "OK" if correct else "WRONG"
+        elif "gold_answer" in case and result.get("text"):
             if suite == "gsm":
                 correct, detail = _score_gsm_response(result["text"], case["gold_answer"])
             else:
