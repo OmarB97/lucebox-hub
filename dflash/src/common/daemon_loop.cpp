@@ -56,7 +56,19 @@ ModelBackend::CompressResult ModelBackend::compress(const CompressRequest & req)
     char tmp_path[] = "/tmp/pflash_XXXXXX.bin";
     int tmp_fd = mkstemps(tmp_path, 4);
     if (tmp_fd < 0) return result;
-    ::write(tmp_fd, req.input_ids.data(), req.input_ids.size() * sizeof(int32_t));
+    const size_t to_write = req.input_ids.size() * sizeof(int32_t);
+    const char *src = reinterpret_cast<const char *>(req.input_ids.data());
+    size_t remaining = to_write;
+    while (remaining > 0) {
+        ssize_t n = ::write(tmp_fd, src, remaining);
+        if (n <= 0) {
+            ::close(tmp_fd);
+            ::unlink(tmp_path);
+            return result;
+        }
+        src += n;
+        remaining -= (size_t)n;
+    }
     ::close(tmp_fd);
 
     // Build collecting DaemonIO
