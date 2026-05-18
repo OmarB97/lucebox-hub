@@ -2785,7 +2785,12 @@ int main(int argc, char ** argv) {
             auto T_accept = sync_us();
             tt_accept += std::chrono::duration<double, std::micro>(T_accept - T_verify_compute).count();
 
-            if (hit_eos) break;
+            // A `next_token` of -1 means the tree walk found no continuation
+            // (EOS region / dead-end). Stop here: otherwise last_tok stays -1,
+            // the next iteration feeds it to w.embedder.embed(), that fails,
+            // and the decode loop returns 1 without writing the output file
+            // or printing the summary line (issue #191).
+            if (hit_eos || last_tok < 0 || IS_EOS_TOK(last_tok, w)) break;
 
             // Rollback: per-layer DeltaNet SSM and conv state + KV compaction
             // for full-attention layers.
