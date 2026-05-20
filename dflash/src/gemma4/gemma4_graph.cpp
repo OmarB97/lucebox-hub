@@ -178,6 +178,7 @@ static ggml_tensor * build_gemma4_attn_block(
     int cache_il = cache.kv_source[il];
     ggml_tensor * cache_k = cache.k[cache_il];
     ggml_tensor * cache_v = cache.v[cache_il];
+    const int cache_len = (int)cache_k->ne[1];  // max_ctx for full, swa_size for SWA
 
     if (has_kv) {
         // K/V projection + norm + RoPE + write to cache
@@ -198,42 +199,60 @@ static ggml_tensor * build_gemma4_attn_block(
                               0, rope_base, 1.0f,
                               0.0f, 1.0f, 32.0f, 1.0f);
 
-        // Write K/V to cache
+        // Write K/V to cache (ring-buffer position for SWA layers)
+        const int write_pos = is_swa ? (kv_start % cache_len) : kv_start;
         ggml_tensor * Kcur_T = ggml_permute(ctx, Kcur, 0, 2, 1, 3);
         ggml_tensor * Vcur_T = ggml_permute(ctx, Vcur, 0, 2, 1, 3);
 
         ggml_tensor * k_slot = ggml_view_3d(ctx, cache_k,
             head_dim, n_tokens, n_head_kv,
             cache_k->nb[1], cache_k->nb[2],
-            cache_k->nb[1] * (size_t)kv_start);
+            cache_k->nb[1] * (size_t)write_pos);
         ggml_tensor * v_slot = ggml_view_3d(ctx, cache_v,
             head_dim, n_tokens, n_head_kv,
             cache_v->nb[1], cache_v->nb[2],
-            cache_v->nb[1] * (size_t)kv_start);
+            cache_v->nb[1] * (size_t)write_pos);
         ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_T, k_slot));
         ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_T, v_slot));
     }
     // else: KV-sharing layer — cache already written by source layer
 
     // Flash attention
-    // Pad kv_len to multiple of 256 for CUDA FA kernel compatibility (FATTN_KQ_STRIDE=256)
-    const int kv_len_raw = kv_start + n_tokens;
-    const int kv_len = (kv_len_raw + 255) & ~255;  // round up to 256
+    // For SWA layers: read entire ring buffer (cache_len positions)
+    // For full layers: read all positions (or windowed if fa_window > 0)
+    const int fa_window = cache.fa_window;
+    const int full_win_start = (!is_swa && fa_window > 0 && kv_start > fa_window)
+                                   ? (kv_start - fa_window) : 0;
+    const int kv_len_raw = is_swa ? std::min(kv_start + n_tokens, cache_len)
+                                  : (kv_start + n_tokens - full_win_start);
+    const int kv_len = (kv_len_raw + 255) & ~255;  // pad to 256 for CUDA FA
 
     ggml_tensor * Qfa = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
     Qfa = ggml_cont(ctx, Qfa);
 
+    const size_t cache_offset = is_swa ? 0 : (cache_k->nb[1] * (size_t)full_win_start);
     ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
         head_dim, kv_len, n_head_kv,
-        cache_k->nb[1], cache_k->nb[2], 0);
+        cache_k->nb[1], cache_k->nb[2], cache_offset);
     ggml_tensor * Vfa = ggml_view_3d(ctx, cache_v,
         head_dim, kv_len, n_head_kv,
-        cache_v->nb[1], cache_v->nb[2], 0);
+        cache_v->nb[1], cache_v->nb[2], cache_offset);
 
     // Gemma4 uses self.scaling = 1.0 (no QK scaling) because Q/K are already
     // RMS-normed per-head. Standard 1/sqrt(head_dim) is NOT used here.
     const float kq_scale = 1.0f;
-    ggml_tensor * use_mask = is_swa ? attn_mask_swa : attn_mask_full;
+    ggml_tensor * use_mask;
+    if (is_swa) {
+        use_mask = attn_mask_swa;
+    } else if (full_win_start > 0) {
+        // View the mask starting at full_win_start column
+        use_mask = ggml_view_4d(ctx, attn_mask_full,
+            kv_len, n_tokens, 1, 1,
+            attn_mask_full->nb[1], attn_mask_full->nb[2], attn_mask_full->nb[3],
+            (size_t)full_win_start * ggml_element_size(attn_mask_full));
+    } else {
+        use_mask = attn_mask_full;
+    }
     ggml_tensor * attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, use_mask,
                                               kq_scale, 0.0f, 0.0f);
 
@@ -357,13 +376,18 @@ bool gemma4_step(
     }
 
     // Attention masks (full + SWA)
-    // Pad kv_len to 256 for CUDA FA kernel compatibility (FATTN_KQ_STRIDE=256)
+    // Full-attention mask: covers all positions [0, kv_start+n_tokens)
     const int kv_len_raw = kv_start + n_tokens;
     const int kv_len_padded = (kv_len_raw + 255) & ~255;
     ggml_tensor * mk_full = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kv_len_padded, n_tokens, 1, 1);
     ggml_set_input(mk_full);
     ggml_tensor * mk_full_f16 = ggml_cast(ctx, mk_full, GGML_TYPE_F16);
-    ggml_tensor * mk_swa = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kv_len_padded, n_tokens, 1, 1);
+
+    // SWA mask: covers the ring buffer [0, swa_size) with ring-buffer indexing
+    const int swa_size = cache.swa_size;
+    const int swa_len_raw = std::min(kv_start + n_tokens, swa_size);
+    const int swa_len_padded = (swa_len_raw + 255) & ~255;
+    ggml_tensor * mk_swa = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, swa_len_padded, n_tokens, 1, 1);
     ggml_set_input(mk_swa);
     ggml_tensor * mk_swa_f16 = ggml_cast(ctx, mk_swa, GGML_TYPE_F16);
 
@@ -466,15 +490,23 @@ bool gemma4_step(
     }
     ggml_backend_tensor_set(mk_full, mfull.data(), 0, ggml_nbytes(mk_full));
 
-    // SWA mask — padded positions are masked with -inf
-    std::vector<float> mswa((size_t)kv_len_padded * n_tokens, -INFINITY);
+    // SWA ring-buffer mask — maps cache indices to absolute positions
     const int W = w.sliding_window;
+    std::vector<float> mswa((size_t)swa_len_padded * n_tokens, -INFINITY);
     for (int q = 0; q < n_tokens; ++q) {
         const int abs_q = kv_start + q;
         const int win_lo = std::max(0, abs_q - W + 1);
-        for (int k = win_lo; k <= abs_q && k < kv_len_raw; ++k) {
-            mswa[(size_t)q * kv_len_padded + k] = 0.0f;
+        // The ring buffer stores the most recent min(abs_q+1, swa_size) entries.
+        // Cache slot j holds absolute position: depends on how many tokens written.
+        const int total_written = abs_q + 1;  // positions [0..abs_q] written so far
+        for (int abs_k = win_lo; abs_k <= abs_q; ++abs_k) {
+            // Map absolute position to ring-buffer slot
+            const int slot = abs_k % swa_size;
+            if (slot < swa_len_raw) {
+                mswa[(size_t)q * swa_len_padded + slot] = 0.0f;
+            }
         }
+        (void)total_written;
     }
     ggml_backend_tensor_set(mk_swa, mswa.data(), 0, ggml_nbytes(mk_swa));
 
@@ -533,7 +565,12 @@ bool gemma4_verify_batch(
     ggml_tensor * mk_full = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kv_len_padded, n_tokens, 1, 1);
     ggml_set_input(mk_full);
     ggml_tensor * mk_full_f16 = ggml_cast(ctx, mk_full, GGML_TYPE_F16);
-    ggml_tensor * mk_swa = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kv_len_padded, n_tokens, 1, 1);
+
+    // SWA mask: ring-buffer sized
+    const int swa_size = cache.swa_size;
+    const int swa_len_raw = std::min(kv_start + n_tokens, swa_size);
+    const int swa_len_padded = (swa_len_raw + 255) & ~255;
+    ggml_tensor * mk_swa = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, swa_len_padded, n_tokens, 1, 1);
     ggml_set_input(mk_swa);
     ggml_tensor * mk_swa_f16 = ggml_cast(ctx, mk_swa, GGML_TYPE_F16);
 
@@ -615,13 +652,17 @@ bool gemma4_verify_batch(
     }
     ggml_backend_tensor_set(mk_full, mfull.data(), 0, ggml_nbytes(mk_full));
 
-    std::vector<float> mswa((size_t)kv_len_padded * n_tokens, -INFINITY);
+    // SWA ring-buffer mask
     const int W = w.sliding_window;
+    std::vector<float> mswa((size_t)swa_len_padded * n_tokens, -INFINITY);
     for (int q = 0; q < n_tokens; ++q) {
         const int abs_q = kv_start + q;
         const int win_lo = std::max(0, abs_q - W + 1);
-        for (int k = win_lo; k <= abs_q && k < kv_len_raw; ++k) {
-            mswa[(size_t)q * kv_len_padded + k] = 0.0f;
+        for (int abs_k = win_lo; abs_k <= abs_q; ++abs_k) {
+            const int slot = abs_k % swa_size;
+            if (slot < swa_len_raw) {
+                mswa[(size_t)q * swa_len_padded + slot] = 0.0f;
+            }
         }
     }
     ggml_backend_tensor_set(mk_swa, mswa.data(), 0, ggml_nbytes(mk_swa));

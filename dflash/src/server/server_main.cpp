@@ -16,6 +16,7 @@
 #include "common/backend_factory.h"
 #include "common/gguf_inspect.h"
 
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

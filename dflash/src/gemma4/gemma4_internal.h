@@ -158,6 +158,8 @@ struct Gemma4Cache {
     int cur_pos  = 0;
     int max_ctx  = 0;
     int n_layer  = 0;
+    int swa_size = 0;   // ring-buffer size for SWA layers (= sliding_window)
+    int fa_window = 0;  // sparse decode window for full-attn layers (0 = full)
 
     // Only layers where has_kv[il] == true have real K/V tensors.
     // KV-reuse layers reference an earlier layer's cache.

@@ -50,6 +50,7 @@ bool Gemma4Backend::init() {
         std::fprintf(stderr, "[gemma4] cache alloc failed\n");
         return false;
     }
+    cache_.fa_window = cfg_.fa_window;
 
     std::printf("[gemma4] init ok: %d layers, embd=%d, vocab=%d, max_ctx=%d\n",
                 w_.n_layer, w_.n_embd, w_.n_vocab, cfg_.device.max_ctx);
@@ -124,6 +125,12 @@ int Gemma4Backend::do_prefill(const std::vector<int32_t> & tokens,
     int pos = 0;
     while (pos < n) {
         int len = std::min(chunk, n - pos);
+
+        // Limit chunk to avoid ring-buffer wrap for SWA layers
+        if (cache_.swa_size > 0 && cache_.swa_size < cache_.max_ctx) {
+            const int swa_remaining = cache_.swa_size - ((kv_offset + pos) % cache_.swa_size);
+            len = std::min(len, swa_remaining);
+        }
 
         // Embed tokens using CPU embedder
         w_.embedder.embed(tokens.data() + pos, len, embed.data());
@@ -290,17 +297,17 @@ GenerateResult Gemma4Backend::restore_and_generate(int slot,
     }
 
     const auto & snap = snapshots_[slot];
-    // Restore snapshot into cache per-head (cache: [D, max_ctx, Hk]).
+    // Restore snapshot into cache per-head (cache: [D, cache_len, Hk]).
     for (int il = 0; il < cache_.n_layer; ++il) {
         if (cache_.k[il] && snap.k_snap[il]) {
             ggml_tensor * ck = cache_.k[il];
             const int D   = (int)ck->ne[0];
             const int Hk  = (int)ck->ne[2];
-            const int max_ctx = (int)ck->ne[1];
-            const int spos = snap.cur_pos;
+            const int cache_len = (int)ck->ne[1];
+            const int save_pos = (int)snap.k_snap[il]->ne[1];  // min(snap.cur_pos, cache_len)
             const size_t elem_sz = ggml_element_size(ck);
-            const size_t head_bytes_src = (size_t)D * spos * elem_sz;
-            const size_t head_bytes_dst = (size_t)D * max_ctx * elem_sz;
+            const size_t head_bytes_src = (size_t)D * save_pos * elem_sz;
+            const size_t head_bytes_dst = (size_t)D * cache_len * elem_sz;
             const size_t copy_bytes     = head_bytes_src;
 
             for (int h = 0; h < Hk; ++h) {
@@ -426,13 +433,14 @@ bool Gemma4Backend::snapshot_save(int slot) {
         snap.v_snap.resize(n_layer, nullptr);
         for (int il = 0; il < n_layer; ++il) {
             if (cache_.k[il]) {
-                // Cache layout: [D, max_ctx, Hk]
-                // Snapshot: [D, snap_pos, Hk] — same axis order, truncated positions
                 ggml_tensor * ck = cache_.k[il];
+                const int cache_len = (int)ck->ne[1];
+                // Save min(snap_pos, cache_len) positions
+                const int save_pos = std::min(snap_pos, cache_len);
                 snap.k_snap[il] = ggml_new_tensor_3d(snap.ctx, ck->type,
-                                                      ck->ne[0], snap_pos, ck->ne[2]);
+                                                      ck->ne[0], save_pos, ck->ne[2]);
                 snap.v_snap[il] = ggml_new_tensor_3d(snap.ctx, ck->type,
-                                                      ck->ne[0], snap_pos, ck->ne[2]);
+                                                      ck->ne[0], save_pos, ck->ne[2]);
             }
         }
 
@@ -444,19 +452,19 @@ bool Gemma4Backend::snapshot_save(int slot) {
         }
     }
 
-    // Copy snap_pos positions per head.
-    // Cache: [D, max_ctx, Hk], Snap: [D, snap_pos, Hk]
-    // Per head h: copy D*snap_pos elements from cache offset h*D*max_ctx to snap offset h*D*snap_pos
+    // Copy valid positions per head.
+    // Cache: [D, cache_len, Hk], Snap: [D, save_pos, Hk]
     for (int il = 0; il < n_layer; ++il) {
         if (cache_.k[il] && snap.k_snap[il]) {
             ggml_tensor * ck = cache_.k[il];
             const int D   = (int)ck->ne[0];
             const int Hk  = (int)ck->ne[2];
-            const int max_ctx = (int)ck->ne[1];
+            const int cache_len = (int)ck->ne[1];
+            const int save_pos = std::min(snap_pos, cache_len);
             const size_t elem_sz = ggml_element_size(ck);
-            const size_t head_bytes_src = (size_t)D * max_ctx * elem_sz;
-            const size_t head_bytes_dst = (size_t)D * snap_pos * elem_sz;
-            const size_t copy_bytes     = head_bytes_dst;  // D * snap_pos * elem_sz per head
+            const size_t head_bytes_src = (size_t)D * cache_len * elem_sz;
+            const size_t head_bytes_dst = (size_t)D * save_pos * elem_sz;
+            const size_t copy_bytes     = head_bytes_dst;
 
             for (int h = 0; h < Hk; ++h) {
                 ggml_backend_tensor_get(cache_.k[il],
@@ -493,15 +501,76 @@ int Gemma4Backend::snapshot_cur_pos(int slot) const {
 
 bool Gemma4Backend::handle_compress(const std::string & line,
                                      const DaemonIO & io) {
-    (void)line; (void)io;
-    // Gemma4 doesn't use pflash drafter for compression (yet).
-    std::printf("[gemma4] compress: not supported\n");
-    std::fflush(stdout);
-    return true;
+    // Check for "nopark" suffix
+    bool skip_park = (line.size() >= 16 &&
+                      line.compare(line.size() - 7, 7, " nopark") == 0);
+
+    // Parse: "compress <path> <keep_x1000> <drafter_gguf> [nopark]"
+    char ppath[1024];
+    int  keep_x1000 = 0;
+    char drafter_path[1024] = {0};
+    const int n = std::sscanf(line.c_str() + 9, "%1023s %d %1023s",
+                               ppath, &keep_x1000, drafter_path);
+    if (n < 2) {
+        std::fprintf(stderr, "[compress] bad args\n");
+        io.emit(-1);
+        return false;
+    }
+
+    const char * dpath = (n >= 3 && drafter_path[0])
+        ? drafter_path
+        : "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf";
+
+    // Park target to free VRAM for the drafter (unless skip_park).
+    const bool was_parked = parked_;
+    if (!skip_park && !parked_) {
+        park("target");
+    }
+
+    // Synchronize backend
+    ggml_backend_synchronize(backend_);
+
+    // Load drafter (lazy — stays resident for subsequent calls)
+    if (!drafter_loaded_) {
+        std::fprintf(stderr, "[compress] loading drafter from %s ...\n", dpath);
+        if (!load_drafter(dpath, /*gpu_layers=*/999, drafter_ctx_)) {
+            std::fprintf(stderr, "[compress] drafter init failed: %s\n",
+                         dflash27b_last_error());
+            io.emit(-1);
+            if (!skip_park && !was_parked) unpark("target");
+            return false;
+        }
+        drafter_loaded_ = true;
+        std::fprintf(stderr, "[compress] drafter ready\n");
+    }
+
+    std::vector<int32_t> tokens = read_int32_file(ppath);
+    bool ok = false;
+    if (!tokens.empty()) {
+        const float keep = (float)keep_x1000 / 1000.0f;
+        auto compressed = drafter_score_and_compress(drafter_ctx_, tokens, keep);
+        ok = !compressed.empty();
+        if (ok) {
+            std::fprintf(stderr, "[compress] %zu -> %zu tokens\n",
+                          tokens.size(), compressed.size());
+            for (int32_t t : compressed) io.emit(t);
+        }
+    }
+    io.emit(-1);
+
+    // Restore park state
+    if (!skip_park && !was_parked) {
+        unpark("target");
+    }
+
+    return ok;
 }
 
 void Gemma4Backend::free_drafter() {
-    // No drafter to free.
+    if (drafter_loaded_) {
+        dflash27b::free_drafter(drafter_ctx_);
+        drafter_loaded_ = false;
+    }
 }
 
 bool Gemma4Backend::try_handle_command(const std::string & line,
@@ -514,6 +583,7 @@ bool Gemma4Backend::try_handle_command(const std::string & line,
 
 void Gemma4Backend::shutdown() {
     for (int i = 0; i < PREFIX_SLOTS; ++i) snapshot_free(i);
+    free_drafter();
     free_gemma4_cache(cache_);
     free_gemma4_weights(w_);
     free_snapshot_backend(snap_backend_, backend_);

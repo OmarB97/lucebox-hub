@@ -385,16 +385,20 @@ bool create_gemma4_cache(ggml_backend_t backend, const Gemma4Weights & w,
     out.v.resize(w.n_layer, nullptr);
     out.kv_source.resize(w.n_layer);
 
+    // SWA layers use a ring buffer of size min(sliding_window, max_ctx).
+    const int swa_size = (w.sliding_window > 0 && w.sliding_window < max_ctx)
+                             ? w.sliding_window : max_ctx;
+
     // Determine KV source for each layer
     int last_kv_layer = -1;
     for (int il = 0; il < w.n_layer; ++il) {
         if (w.has_kv[il]) {
             const int D  = gemma4_head_dim(w, il);
             const int Hk = gemma4_n_head_kv(w, il);
-            // Layout: [head_dim, max_ctx, n_head_kv] — positions before heads
-            // (matches the view strides used in build_gemma4_attn_block)
-            out.k[il] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F16, D, max_ctx, Hk);
-            out.v[il] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F16, D, max_ctx, Hk);
+            const bool is_swa = gemma4_is_swa_layer(w, il);
+            const int cache_len = is_swa ? swa_size : max_ctx;
+            out.k[il] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F16, D, cache_len, Hk);
+            out.v[il] = ggml_new_tensor_3d(out.ctx, GGML_TYPE_F16, D, cache_len, Hk);
             out.kv_source[il] = il;
             last_kv_layer = il;
         } else {
@@ -412,6 +416,7 @@ bool create_gemma4_cache(ggml_backend_t backend, const Gemma4Weights & w,
     out.cur_pos = 0;
     out.max_ctx = max_ctx;
     out.n_layer = w.n_layer;
+    out.swa_size = swa_size;
     return true;
 }
 

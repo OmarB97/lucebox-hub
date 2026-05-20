@@ -9,6 +9,7 @@
 #include "common/device_placement.h"
 #include "gemma4_internal.h"
 #include "common/sampler.h"
+#include "../qwen3/qwen3_drafter.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -24,6 +25,7 @@ struct Gemma4BackendConfig {
     DevicePlacement device;
     int             stream_fd  = -1;
     int             chunk      = 512;
+    int             fa_window  = 0;     // 0 = full attention; >0 = sparse decode window
 };
 
 class Gemma4Backend : public ModelBackend {
@@ -75,6 +77,10 @@ private:
     // Sampler
     SamplerCfg            sampler_;
     std::mt19937_64       sampler_rng_{std::random_device{}()};
+
+    // PFlash drafter (compress)
+    DrafterContext        drafter_ctx_;
+    bool                  drafter_loaded_ = false;
 
     // Snapshots
     static constexpr int PREFIX_SLOTS = 64;
