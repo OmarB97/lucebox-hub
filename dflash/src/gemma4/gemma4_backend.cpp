@@ -401,16 +401,14 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
         }
         draft_tok[0] = last_tok;
 
-        // 4. Verify: snapshot KV, run target forward over draft tokens
-        if (!target->snapshot_kv()) {
-            step_graph_destroy(draft_sg);
-            return false;
-        }
-
+        // 4. Verify: run target forward over all draft tokens.
+        // Gemma4 is a pure transformer — after verify, KV entries at accepted
+        // positions are already correct (causal masking guarantees independence
+        // from rejected tokens at later positions). We use KV truncation instead
+        // of the expensive snapshot/restore/replay approach.
         int verify_last_tok = -1;
         if (!target->verify_batch(draft_tok, committed, verify_last_tok, &target_tok)) {
             std::fprintf(stderr, "[gemma4-spec] verify failed\n");
-            target->restore_kv();
             step_graph_destroy(draft_sg);
             return false;
         }
@@ -428,25 +426,26 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
             if (commit_n <= accept_n) bonus_tok = -1;
         }
 
-        // 6. Replay: roll back KV and re-run accepted tokens
-        if (!target->restore_kv()) {
-            step_graph_destroy(draft_sg);
-            return false;
+        // 6. KV truncation: discard rejected positions, keep accepted.
+        // Accepted positions 0..accept_n-1 already have correct KV from verify.
+        cache_.cur_pos = committed + accept_n;
+
+        // If there's a bonus token, run a 1-token forward to get its KV + features.
+        if (bonus_tok >= 0) {
+            std::vector<int32_t> bonus_vec = {bonus_tok};
+            int bonus_last = -1;
+            if (!target->verify_batch(bonus_vec, committed + accept_n, bonus_last, nullptr)) {
+                std::fprintf(stderr, "[gemma4-spec] bonus forward failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            last_tok = bonus_last;
+        } else {
+            last_tok = verify_last_tok;
         }
 
-        std::vector<int32_t> replay_tok((size_t)commit_n);
-        for (int i = 0; i < commit_n; i++) {
-            replay_tok[i] = (i < accept_n) ? draft_tok[i] : bonus_tok;
-        }
-        int replay_last_tok = -1;
-        if (!target->verify_batch(replay_tok, committed, replay_last_tok, nullptr)) {
-            std::fprintf(stderr, "[gemma4-spec] replay failed\n");
-            step_graph_destroy(draft_sg);
-            return false;
-        }
-        last_tok = replay_last_tok;
-
-        // 7. Sync features for replayed range
+        // 7. Sync features from verify (positions 0..accept_n-1 are correct)
+        // and from bonus forward (position accept_n, if present).
         if (feature_mirror_.target_feat && cache_.target_feat) {
             draft_feature_mirror_sync_range(cache_.target_feat, cache_.target_feat_cap,
                                             feature_mirror_, committed, commit_n);
@@ -456,11 +455,12 @@ bool Gemma4Backend::do_spec_decode(int committed, int n_gen,
         bool hit_eos = false;
         int emitted = 0;
         for (int i = 0; i < commit_n; i++) {
-            out_tokens.push_back(replay_tok[i]);
-            io.emit(replay_tok[i]);
+            int tok = (i < accept_n) ? draft_tok[i] : bonus_tok;
+            out_tokens.push_back(tok);
+            io.emit(tok);
             emitted++;
             if (io.cancelled) break;
-            if (replay_tok[i] == w_.eos_id || replay_tok[i] == w_.eos_chat_id) {
+            if (tok == w_.eos_id || tok == w_.eos_chat_id) {
                 hit_eos = true; break;
             }
         }
