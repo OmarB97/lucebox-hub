@@ -68,6 +68,7 @@ static void print_usage(const char * prog) {
         "  --prefill-keep-ratio <F>    Fraction of tokens to keep (default: 0.05)\n"
         "  --prefill-drafter <path>    Drafter GGUF for compression (Qwen3-0.6B)\n"
         "  --prefill-skip-park         Skip park/unpark (for >=32GB GPUs)\n"
+        "  --lazy-draft                Park decode draft when idle to save VRAM\n"
         "\n"
         "Disk KV cache:\n"
         "  --kv-cache-dir <path>       Directory for ondisk KV cache (enables feature)\n"
@@ -140,6 +141,8 @@ int main(int argc, char ** argv) {
             sconfig.pflash_drafter_path = argv[++i];
         } else if (std::strcmp(argv[i], "--prefill-skip-park") == 0) {
             sconfig.pflash_skip_park = true;
+        } else if (std::strcmp(argv[i], "--lazy-draft") == 0) {
+            sconfig.lazy_draft = true;
         } else if (std::strcmp(argv[i], "--kv-cache-dir") == 0 && i + 1 < argc) {
             sconfig.disk_cache_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--kv-cache-budget") == 0 && i + 1 < argc) {
@@ -192,6 +195,12 @@ int main(int argc, char ** argv) {
         setenv("DFLASH_FP_USE_BSA", "1", 0);
         setenv("DFLASH_FP_ALPHA", "0.85", 0);
         setenv("DFLASH27B_FA_WINDOW", "0", 0);
+    }
+
+    // Lazy-draft requires both prefill-drafter AND decode draft to be useful.
+    if (sconfig.lazy_draft && !(pflash_enabled && bargs.draft_path)) {
+        std::fprintf(stderr, "[server] --lazy-draft ignored: requires both --prefill-drafter and --draft\n");
+        sconfig.lazy_draft = false;
     }
 
     // Load tokenizer.
@@ -269,6 +278,9 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[server] │  fp_use_bsa      = %s\n", getenv("DFLASH_FP_USE_BSA") ? "ON" : "off");
     std::fprintf(stderr, "[server] │  fp_alpha        = %s\n", getenv("DFLASH_FP_ALPHA") ? getenv("DFLASH_FP_ALPHA") : "0.12 (default)");
     }
+    if (bargs.draft_path) {
+    std::fprintf(stderr, "[server] │  lazy_draft      = %s\n", sconfig.lazy_draft ? "ON" : "off");
+    }
     std::fprintf(stderr, "[server] ╰─────────────────────────────────────────────────────╯\n\n");
 
     HttpServer server(*backend, tokenizer, sconfig);
@@ -278,6 +290,12 @@ int main(int argc, char ** argv) {
     if (pflash_enabled) {
         server.set_drafter_tokenizer(&drafter_tokenizer);
     }
+
+    // Lazy-draft: park decode draft at startup to free VRAM (~3.3 GB).
+    if (sconfig.lazy_draft && bargs.draft_path) {
+        backend->park("draft");
+    }
+
     int ret = server.run();
 
     // Cleanup.
