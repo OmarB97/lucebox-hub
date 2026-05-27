@@ -50,21 +50,21 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 | Model | Speedup |
 |-------|:-------:|
 | Qwen 3.5-0.8B (Megakernel) | **~2×** |
-| Qwen 3.5-27B Q4_K_M (DFlash + DDTree) | **3.43×** |
-| Qwen 3.6-27B Q4_K_M (DFlash + PFlash) | **~5.6×** |
-| Qwen 3.6-27B Q4_K_M (DFlash + DDTree) | **4.84×** |
-| Laguna-XS.2 33B-A3B Q4_K_M (DFlash + PFlash) | **5.4×** @ 128K |
-| Qwen 3.5-27B Q4_K_M (DFlash + PFlash, HIP) | **~2.6×** |
-| Gemma-4-26B-A4B Q4_K_M (DFlash) | **1.31×** |
+| Qwen 3.5-27B + DDTree | **3.43×** |
+| Qwen 3.6-27B + PFlash | **~5.6×** |
+| Qwen 3.6-27B + DDTree | **4.84×** |
+| Laguna-XS.2 33B + PFlash | **5.4×** @128K |
+| Qwen 3.5-27B HIP | **~2.6×** |
+| Gemma-4-26B-A4B | **1.31×** |
 
 </td>
 <td valign="top">
 
 | Drafter | Phase |
 |---------|:-----:|
-| [`Qwen3.6-27B-DFlash`](https://huggingface.co/Lucebox/Qwen3.6-27B-DFlash-GGUF) | decode |
-| [`gemma-4-26B-A4B-DFlash`](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF) | decode |
-| [`gemma-4-31B-DFlash`](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF) | decode |
+| [`Qwen3.6-27B`](https://huggingface.co/Lucebox/Qwen3.6-27B-DFlash-GGUF) | decode |
+| [`gemma-4-26B-A4B`](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF) | decode |
+| [`gemma-4-31B`](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF) | decode |
 | [`Qwen3-0.6B`](https://huggingface.co/Qwen/Qwen3-0.6B) | prefill |
 
 </td>
@@ -77,15 +77,15 @@ Reference target: **RTX 3090 (Ampere sm_86)** — all headline numbers. Other NV
 
 | | Arch | GPU | Min CUDA / ROCm | Status | Bench |
 |:---:|------|-----|:---------------:|--------|:-----:|
-| <img src="assets/gpus/3090.png" width="140" /> | Ampere `sm_86` | RTX 3090, A-series | CUDA 12.0 | ✅ reference | [megakernel](optimizations/megakernel/RESULTS.md#rtx-3090-pp520-tg128) · [dflash](server/RESULTS.md) |
-| <img src="assets/gpus/5090.png" width="140" /> | Blackwell `sm_120` | RTX 5090 | CUDA 12.8 | ✅ 205 tok/s, 4.84× | [↗](server/RESULTS.md#rtx-5090-blackwell-sm_120sm_120a-32-gb) |
-| <img src="assets/gpus/gb10.png" width="140" /> | Blackwell `sm_121` | DGX Spark / GB10 | CUDA 12.9 | ✅ megakernel NVFP4 | [↗](optimizations/megakernel/RESULTS.md#nvidia-dgx-spark-gb10-sm_121a) |
-| <img src="assets/gpus/2080ti.png" width="140" /> | Turing `sm_75` | RTX 2080 Ti | CUDA 12.0 | ✅ 53 tok/s DFlash | [↗](server/RESULTS.md#rtx-2080-ti-turing-sm_75-22-gb) |
-| <img src="assets/gpus/4090.png" width="140" /> | Ada `sm_89` | RTX 40xx | CUDA 12.0 | 🟡 community WSL2 bench | [↗](server/RESULTS.md#rtx-4090-ada-sm_89-24-gb--wsl2-community) |
+| <img src="assets/gpus/3090.png" width="220" /> | Ampere `sm_86` | RTX 3090, A-series | CUDA 12.0 | ✅ reference | [megakernel](optimizations/megakernel/RESULTS.md#rtx-3090-pp520-tg128) · [dflash](server/RESULTS.md) |
+| <img src="assets/gpus/5090.png" width="220" /> | Blackwell `sm_120` | RTX 5090 | CUDA 12.8 | ✅ 205 tok/s, 4.84× | [↗](server/RESULTS.md#rtx-5090-blackwell-sm_120sm_120a-32-gb) |
+| <img src="assets/gpus/gb10.png" width="220" /> | Blackwell `sm_121` | DGX Spark / GB10 | CUDA 12.9 | ✅ megakernel NVFP4 | [↗](optimizations/megakernel/RESULTS.md#nvidia-dgx-spark-gb10-sm_121a) |
+| <img src="assets/gpus/2080ti.png" width="220" /> | Turing `sm_75` | RTX 2080 Ti | CUDA 12.0 | ✅ 53 tok/s DFlash | [↗](server/RESULTS.md#rtx-2080-ti-turing-sm_75-22-gb) |
+| <img src="assets/gpus/4090.png" width="220" /> | Ada `sm_89` | RTX 40xx | CUDA 12.0 | 🟡 community WSL2 bench | [↗](server/RESULTS.md#rtx-4090-ada-sm_89-24-gb--wsl2-community) |
 | — | Blackwell `sm_110` | Jetson AGX Thor | CUDA 13.0 | 🟡 builds, unbenched | — |
-| <img src="assets/gpus/v100.png" width="140" /> | Volta `sm_70` / Pascal `sm_61` | V100, P40 | CUDA 12.0 | 🟡 fallback paths, unbenched | — |
-| <img src="assets/gpus/ryze395.png" width="140" /> | RDNA3.5 `gfx1151` | Ryzen AI MAX+ 395 / Strix Halo | ROCm 6+ | ✅ 37 tok/s HIP | [↗](#amd-strix-halo-hip-backend) |
-| <img src="assets/gpus/7900xtx.png" width="140" /> | RDNA3 `gfx1100` | Radeon RX 7900 XTX | ROCm 6+ | ✅ 50 tok/s HIP | [↗](server/docs/HIP_PERF_PLAN.md) |
+| <img src="assets/gpus/v100.png" width="220" /> | Volta `sm_70` / Pascal `sm_61` | V100, P40 | CUDA 12.0 | 🟡 fallback paths, unbenched | — |
+| <img src="assets/gpus/ryze395.png" width="220" /> | RDNA3.5 `gfx1151` | Ryzen AI MAX+ 395 / Strix Halo | ROCm 6+ | ✅ 37 tok/s HIP | [↗](#amd-strix-halo-hip-backend) |
+| <img src="assets/gpus/7900xtx.png" width="220" /> | RDNA3 `gfx1100` | Radeon RX 7900 XTX | ROCm 6+ | ✅ 50 tok/s HIP | [↗](server/docs/HIP_PERF_PLAN.md) |
 
 `server/` (DFlash) builds with CMake 3.18+ and `--recurse-submodules` for `Luce-Org/llama.cpp@luce-dflash` — no PyTorch needed. `optimizations/megakernel/` is the only component requiring PyTorch 2.0+ (CUDAExtension links against torch C++ libs). Power-tune: `sudo nvidia-smi -pl 220` (3090 sweet spot, re-sweep for other cards).
 
